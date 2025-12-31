@@ -1,0 +1,75 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default: deny everything unless explicitly allowed below.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // User profiles: each user can read/write only their own profile doc.
+    match /users/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // Lottery inventory (read-only for clients).
+    match /lottery/{docId} {
+      allow read: if request.auth != null;
+    }
+
+    // Lottery results (read-only for clients).
+    match /lottery_draws/{docId} {
+      allow read: if request.auth != null;
+    }
+
+    // Ticket image index (read-only for clients).
+    match /ticket_image_index/{docId} {
+      allow read: if request.auth != null;
+    }
+
+    // Admin config documents (read-only for clients).
+    match /app_config/{docId} {
+      allow read: if request.auth != null;
+    }
+
+    // In-app notifications (read-only for clients).
+    match /notifications/{docId} {
+      allow read: if request.auth != null;
+    }
+
+    // Payment history: allow users to create a paid record for themselves,
+    // and read only their own records.
+    match /payment_history/{docId} {
+      allow create: if request.auth != null && request.resource.data.uid == request.auth.uid;
+      allow read: if request.auth != null && resource.data.uid == request.auth.uid;
+    }
+
+    // Cart counts (client-updated in current app).
+    // NOTE: This is permissive. Consider moving writes to Cloud Functions later.
+    match /ticket_cart_counts/{docId} {
+      allow read, write: if request.auth != null;
+    }
+
+    // User cart mirror for admin visibility.
+    // Each user can write/read only their own cart doc.
+    // Admins using server SDK / Firebase Console are not restricted by these rules.
+    match /user_carts/{uid} {
+      allow create, update, delete: if request.auth != null && request.auth.uid == uid;
+      allow read: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // Support chat: each user can create/read their own thread and send messages.
+    // Admin replies are done via server SDK / Firebase Console.
+    match /support_chats/{uid} {
+      allow create, read: if request.auth != null && request.auth.uid == uid;
+      allow update: if request.auth != null && request.auth.uid == uid;
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read: if request.auth != null && request.auth.uid == uid;
+        allow create: if request.auth != null && request.auth.uid == uid
+          && request.resource.data.senderUid == request.auth.uid;
+        allow update, delete: if false;
+      }
+    }
+  }
+}

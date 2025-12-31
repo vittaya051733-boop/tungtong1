@@ -1,0 +1,32 @@
+{
+  "name": "tungtong-functions",
+  "private": true,
+  "engines": {
+    "node": "20"
+  },
+  "main": "lib/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:watch": "tsc -w -p tsconfig.json",
+    "lint": "echo \"(no lint configured)\"",
+    "serve": "npm run build && firebase emulators:start --only functions",
+    "deploy": "npm run build && firebase deploy --only functions",
+    "backfill": "tsx scripts/backfill.ts",
+    "check:index": "tsx scripts/check_index.ts",
+    "seed:app_config": "tsx scripts/seed_app_config.ts",
+    "seed:notifications": "tsx scripts/seed_notifications.ts",
+    "notify:create": "tsx scripts/create_notification.ts"
+  },
+  "dependencies": {
+    "@google-cloud/storage": "^7.14.0",
+    "@google-cloud/vision": "^5.3.4",
+    "firebase-admin": "^12.7.0",
+    "firebase-functions": "^6.4.0",
+    "pdf-parse": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/pdf-parse": "^1.1.4",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  }
+}
