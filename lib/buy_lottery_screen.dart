@@ -38,7 +38,6 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
           defaultTargetPlatform == TargetPlatform.iOS ||
           defaultTargetPlatform == TargetPlatform.macOS);
 
-  static const String _storageBucket = 'gs://van-merchant.firebasestorage.app';
   static const int _pageSize = 10;
 
   // Optional fast-path: if you maintain a Firestore index collection for tickets,
@@ -53,9 +52,9 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
     'lottery',
   ];
 
-  late final FirebaseStorage _storage = FirebaseStorage.instanceFor(
-    bucket: _storageBucket,
-  );
+  // Use the default Firebase app's Storage bucket (configured by
+  // android/app/google-services.json and ios/Runner/GoogleService-Info.plist).
+  late final FirebaseStorage _storage = FirebaseStorage.instance;
 
   // Admin-controlled switch (Firestore): read /app_config/global.isOpen.
   static const String _storeConfigCollection = 'app_config';
@@ -221,6 +220,28 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
               Navigator.of(context).popUntil((route) => route.isFirst);
             });
           }
+        }, onError: (Object error, StackTrace stackTrace) {
+          if (kDebugMode) {
+            debugPrint('Store config stream error: $error');
+          }
+
+          // If the project requires auth for read and anonymous sign-in isn't ready,
+          // this can throw permission-denied asynchronously. In release this can
+          // appear as an app "crash". Recover by ensuring guest auth and retrying.
+          if (_isFirestorePermissionDenied(error)) {
+            unawaited(
+              _ensureAnonymousAuthForRead(showMessageIfFails: true).then((ok) {
+                if (!ok || !mounted) return;
+                _listenStoreConfig();
+              }),
+            );
+            return;
+          }
+
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('โหลดสถานะร้านไม่สำเร็จ')),
+          );
         });
   }
 
@@ -250,6 +271,23 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
   final Map<String, int> _setCountByImagePath = <String, int>{};
   final Set<String> _setCountLoading = <String>{};
   final Map<String, int> _countByTicketNumber = <String, int>{};
+
+  // Paths hidden because another user reserved them.
+  // When their lock expires, we reinsert them into the grid without refresh.
+  final Map<String, DateTime> _reservedByOtherUntil = <String, DateTime>{};
+  Timer? _reservationExpiryTicker;
+  static const Duration _reservationRefreshInterval = Duration(seconds: 1);
+
+    // Realtime reservation watcher: listens for lock changes on the currently-loaded
+    // ticket docs so other users' carts hide numbers immediately.
+    final List<StreamSubscription<QuerySnapshot<Map<String, dynamic>>>>
+    _reservationSubs = <StreamSubscription<QuerySnapshot<Map<String, dynamic>>>>[];
+    Timer? _reservationWatchDebounce;
+    Set<String> _reservationWatchedDocIds = <String>{};
+    final Map<String, List<String>> _pathsByReservationDocId =
+      <String, List<String>>{};
+    static const Duration _reservationWatchDebounceDuration =
+      Duration(milliseconds: 250);
 
   // If a Storage path cannot be shown (missing/permission/invalid), remove it so
   // the grid reflows and doesn't leave visible gaps.
@@ -331,6 +369,295 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
     _listenStoreConfig();
 
     _startRotationCountdown();
+
+    _startReservationExpiryTicker();
+
+    _scheduleReservationWatchUpdate();
+  }
+
+  bool _isFirestorePermissionDenied(Object? e) {
+    return e is FirebaseException && e.code == 'permission-denied';
+  }
+
+  Future<bool> _ensureAnonymousAuthForRead({bool showMessageIfFails = false}) async {
+    final auth = FirebaseAuth.instance;
+    if (auth.currentUser != null) return true;
+    try {
+      await auth.signInAnonymously();
+      return auth.currentUser != null;
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('Anonymous sign-in (BuyLotteryScreen) failed: $e');
+      }
+      if (showMessageIfFails && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'ไม่สามารถเข้าใช้งานแบบผู้เยี่ยมชมได้ (กรุณาเปิด Anonymous Sign-in ใน Firebase Auth)',
+            ),
+          ),
+        );
+      }
+      return false;
+    }
+  }
+
+  Future<T> _withFirestoreAuthRetry<T>(Future<T> Function() action) async {
+    try {
+      return await action();
+    } catch (e) {
+      if (_isFirestorePermissionDenied(e)) {
+        final ok = await _ensureAnonymousAuthForRead(showMessageIfFails: true);
+        if (ok) {
+          return await action();
+        }
+      }
+      rethrow;
+    }
+  }
+
+  DateTime? _lockedUntilFromCountDoc(Map<String, dynamic>? data) {
+    if (data == null) return null;
+    final lockedUntilRaw = data['lockedUntil'];
+    if (lockedUntilRaw is Timestamp) {
+      return lockedUntilRaw.toDate();
+    }
+    // Back-compat fallback: infer a 15-minute lock from lastAddedAt.
+    final lastAddedAtRaw = data['lastAddedAt'];
+    if (lastAddedAtRaw is Timestamp) {
+      return lastAddedAtRaw.toDate().add(const Duration(minutes: 15));
+    }
+    return null;
+  }
+
+  void _markReservedByOther({
+    required List<String> paths,
+    required DateTime? lockedUntil,
+  }) {
+    if (paths.isEmpty) return;
+    final until = lockedUntil ?? DateTime.now().add(const Duration(minutes: 15));
+    for (final p in paths) {
+      final existing = _reservedByOtherUntil[p];
+      if (existing == null || until.isAfter(existing)) {
+        _reservedByOtherUntil[p] = until;
+      }
+    }
+  }
+
+  void _startReservationExpiryTicker() {
+    _reservationExpiryTicker?.cancel();
+    _reservationExpiryTicker = Timer.periodic(_reservationRefreshInterval, (_) {
+      if (!mounted) return;
+      _reinsertExpiredReservedTickets();
+    });
+  }
+
+  void _reinsertExpiredReservedTickets() {
+    if (_reservedByOtherUntil.isEmpty) return;
+    final now = DateTime.now();
+
+    final expired = <String>[];
+    _reservedByOtherUntil.forEach((path, until) {
+      if (!now.isBefore(until)) {
+        expired.add(path);
+      }
+    });
+
+    if (expired.isEmpty) return;
+
+    setState(() {
+      for (final p in expired) {
+        _reservedByOtherUntil.remove(p);
+        if (_ticketImagePathSet.add(p)) {
+          _ticketImagePaths.add(p);
+
+          final ticketNumber = _extractTicketNumberFromPath(p);
+          if (ticketNumber != null && ticketNumber.length == 6) {
+            _countByTicketNumber[ticketNumber] =
+                (_countByTicketNumber[ticketNumber] ?? 0) + 1;
+          }
+
+          if (_mode != BuyMode.all) {
+            unawaited(_ensureSetCountLoaded(p));
+          }
+        }
+      }
+    });
+
+    _scheduleReservationWatchUpdate();
+  }
+
+  void _scheduleReservationWatchUpdate() {
+    _reservationWatchDebounce?.cancel();
+    _reservationWatchDebounce = Timer(_reservationWatchDebounceDuration, () {
+      if (!mounted) return;
+      unawaited(_updateReservationWatches());
+    });
+  }
+
+  void _cancelReservationWatches() {
+    for (final s in _reservationSubs) {
+      s.cancel();
+    }
+    _reservationSubs.clear();
+    _reservationWatchedDocIds = <String>{};
+  }
+
+  void _removeTicketPathLocal(String path) {
+    if (_ticketImagePathSet.remove(path)) {
+      _ticketImagePaths.remove(path);
+
+      final ticketNumber = _extractTicketNumberFromPath(path);
+      if (ticketNumber != null && ticketNumber.length == 6) {
+        final cur = _countByTicketNumber[ticketNumber] ?? 0;
+        if (cur <= 1) {
+          _countByTicketNumber.remove(ticketNumber);
+        } else {
+          _countByTicketNumber[ticketNumber] = cur - 1;
+        }
+      }
+
+      _setCountByImagePath.remove(path);
+      _setCountLoading.remove(path);
+    }
+  }
+
+  void _addTicketPathLocal(String path) {
+    if (_ticketImagePathSet.add(path)) {
+      _ticketImagePaths.add(path);
+
+      final ticketNumber = _extractTicketNumberFromPath(path);
+      if (ticketNumber != null && ticketNumber.length == 6) {
+        _countByTicketNumber[ticketNumber] =
+            (_countByTicketNumber[ticketNumber] ?? 0) + 1;
+      }
+
+      if (_mode != BuyMode.all) {
+        unawaited(_ensureSetCountLoaded(path));
+      }
+    }
+  }
+
+  bool _isReservedByOtherUserDoc(
+    Map<String, dynamic>? data, {
+    required String? myUid,
+  }) {
+    if (data == null) return false;
+
+    final current = (data['addedCount'] as num?)?.toInt() ?? 0;
+    if (current <= 0) return false;
+
+    final lockedUntil = _lockedUntilFromCountDoc(data);
+    final now = DateTime.now();
+    if (lockedUntil != null && now.isAfter(lockedUntil)) return false;
+
+    final lockedBy = (data['lockedByUid'] as String?)?.trim();
+    if (lockedBy == null || lockedBy.isEmpty) return true;
+    if (myUid == null || myUid.trim().isEmpty) return true;
+    return lockedBy != myUid.trim();
+  }
+
+  Future<void> _updateReservationWatches() async {
+    if (!mounted) return;
+
+    final myUid = FirebaseAuth.instance.currentUser?.uid;
+
+    // Watch both currently loaded tickets and those hidden due to reservation.
+    final pathSet = <String>{
+      ..._ticketImagePaths,
+      ..._reservedByOtherUntil.keys,
+    };
+    if (pathSet.isEmpty) {
+      _cancelReservationWatches();
+      _pathsByReservationDocId.clear();
+      return;
+    }
+
+    final nextDocIds = <String>{};
+    final nextPathsByDocId = <String, List<String>>{};
+
+    for (final p in pathSet) {
+      final ticketNumber = _extractTicketNumberFromPath(p);
+      final docId = _TicketCartCollection._docId(
+        imagePath: p,
+        ticketNumber: ticketNumber,
+      );
+      nextDocIds.add(docId);
+      (nextPathsByDocId[docId] ??= <String>[]).add(p);
+    }
+
+    if (nextDocIds.length == _reservationWatchedDocIds.length &&
+        nextDocIds.containsAll(_reservationWatchedDocIds)) {
+      _pathsByReservationDocId
+        ..clear()
+        ..addAll(nextPathsByDocId);
+      return;
+    }
+
+    _cancelReservationWatches();
+    _reservationWatchedDocIds = nextDocIds;
+    _pathsByReservationDocId
+      ..clear()
+      ..addAll(nextPathsByDocId);
+
+    const chunkSize = 30; // Firestore whereIn limit.
+    final docIdList = nextDocIds.toList(growable: false);
+
+    for (var i = 0; i < docIdList.length; i += chunkSize) {
+      final chunk = docIdList.sublist(
+        i,
+        (i + chunkSize).clamp(0, docIdList.length),
+      );
+
+      final sub = FirebaseFirestore.instance
+          .collection(_TicketCartCollection._collection)
+          .where(FieldPath.documentId, whereIn: chunk)
+          .snapshots()
+          .listen((snap) {
+            if (!mounted) return;
+
+            bool changed = false;
+            for (final doc in snap.docs) {
+              final docId = doc.id;
+              final data = doc.data();
+
+              final reservedByOther = _isReservedByOtherUserDoc(
+                data,
+                myUid: myUid,
+              );
+              final paths = _pathsByReservationDocId[docId] ?? const <String>[];
+              if (paths.isEmpty) continue;
+
+              if (reservedByOther) {
+                final until = _lockedUntilFromCountDoc(data);
+                _markReservedByOther(paths: paths, lockedUntil: until);
+                for (final p in paths) {
+                  if (_ticketImagePathSet.contains(p)) {
+                    _removeTicketPathLocal(p);
+                    changed = true;
+                  }
+                }
+              } else {
+                // If it was hidden due to reservation and is now free, re-add immediately.
+                for (final p in paths) {
+                  if (_reservedByOtherUntil.containsKey(p) &&
+                      !_ticketImagePathSet.contains(p)) {
+                    _reservedByOtherUntil.remove(p);
+                    _addTicketPathLocal(p);
+                    changed = true;
+                  }
+                }
+              }
+            }
+
+            if (changed) {
+              setState(() {});
+              _scheduleReservationWatchUpdate();
+            }
+          });
+
+      _reservationSubs.add(sub);
+    }
   }
 
   void _startRotationCountdown() {
@@ -638,6 +965,10 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
       return;
     }
 
+    // Firestore rules in this project require auth even for read-only ticket data.
+    // Treat a guest as an anonymous user so they can browse without a login UI.
+    await _ensureAnonymousAuthForRead(showMessageIfFails: false);
+
     setState(() {
       _isInitialLoading = true;
       _loadError = null;
@@ -788,7 +1119,7 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
           .collection(_firestoreIndexCollection)
           .orderBy('createdAt', descending: true)
           .limit(1);
-      final snap = await query.get();
+      final snap = await _withFirestoreAuthRetry(() => query.get());
       if (snap.docs.isEmpty) return false;
 
       final data = snap.docs.first.data();
@@ -869,38 +1200,122 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
     });
 
     try {
-      final newPaths = <String>[];
+      // Filter out tickets that are currently reserved by other users.
+      final myUid = FirebaseAuth.instance.currentUser?.uid;
 
-      if (_useFirestoreIndex) {
-        var query = FirebaseFirestore.instance
-            .collection(_firestoreIndexCollection)
-            .orderBy('createdAt', descending: true)
-            .limit(_pageSize);
-        if (_firestoreLastDoc != null) {
-          query = query.startAfterDocument(_firestoreLastDoc!);
+      bool isReservedByOther(Map<String, dynamic>? data) {
+        if (data == null) return false;
+
+        final lockedBy = (data['lockedByUid'] as String?)?.trim();
+        final lockedUntil = _lockedUntilFromCountDoc(data);
+
+        final current = (data['addedCount'] as num?)?.toInt() ?? 0;
+        if (current <= 0) return false;
+
+        final now = DateTime.now();
+        if (lockedUntil != null && now.isAfter(lockedUntil)) return false;
+
+        // If lock owner is unknown, treat as reserved.
+        if (lockedBy == null || lockedBy.isEmpty) return true;
+        if (myUid == null || myUid.trim().isEmpty) return true;
+        return lockedBy != myUid.trim();
+      }
+
+      Future<List<String>> filterOutReservedByOtherUsers(
+        List<String> candidates,
+      ) async {
+        if (candidates.isEmpty) return candidates;
+
+        // Build docIds (digits preferred; fallback to path-based id).
+        final docIdByPath = <String, String>{};
+        final pathsByDocId = <String, List<String>>{};
+        final docIds = <String>[];
+        for (final p in candidates) {
+          final ticketNumber = _extractTicketNumberFromPath(p);
+          final docId = _TicketCartCollection._docId(
+            imagePath: p,
+            ticketNumber: ticketNumber,
+          );
+          docIdByPath[p] = docId;
+          (pathsByDocId[docId] ??= <String>[]).add(p);
+          docIds.add(docId);
         }
 
-        final snap = await query.get();
-        final indexCandidates = <String>[];
-        for (final doc in snap.docs) {
-          final data = doc.data();
-          final path = (data['path'] as String?)?.trim() ?? '';
-          if (path.isEmpty) continue;
-          if (!_isImagePath(path)) continue;
-          indexCandidates.add(path);
-        }
+        final reservedDocIds = <String>{};
+        const chunkSize = 30; // Firestore whereIn limit.
+        for (var i = 0; i < docIds.length; i += chunkSize) {
+          final chunk = docIds.sublist(
+            i,
+            (i + chunkSize).clamp(0, docIds.length),
+          );
+          final q = await _withFirestoreAuthRetry(() {
+            return FirebaseFirestore.instance
+                .collection(_TicketCartCollection._collection)
+                .where(FieldPath.documentId, whereIn: chunk)
+                .get();
+          });
 
-        for (final p in indexCandidates) {
-          if (await _shouldDisplayIndexPath(p)) {
-            newPaths.add(p);
+          for (final d in q.docs) {
+            if (isReservedByOther(d.data())) {
+              reservedDocIds.add(d.id);
+
+              // Record expiry for realtime re-appearance.
+              _markReservedByOther(
+                paths: pathsByDocId[d.id] ?? const <String>[],
+                lockedUntil: _lockedUntilFromCountDoc(d.data()),
+              );
+            }
           }
         }
 
-        if (snap.docs.isNotEmpty) {
-          _firestoreLastDoc = snap.docs.last;
-        }
-        if (snap.docs.length < _pageSize) {
-          _hasMore = false;
+        return candidates
+            .where((p) => !reservedDocIds.contains(docIdByPath[p]))
+            .toList(growable: false);
+      }
+
+      final newPaths = <String>[];
+
+      if (_useFirestoreIndex) {
+        // Try a few times to fill a page after filtering out reserved tickets.
+        for (var attempt = 0; attempt < 3 && newPaths.length < _pageSize; attempt++) {
+          var query = FirebaseFirestore.instance
+              .collection(_firestoreIndexCollection)
+              .orderBy('createdAt', descending: true)
+              .limit(_pageSize);
+          if (_firestoreLastDoc != null) {
+            query = query.startAfterDocument(_firestoreLastDoc!);
+          }
+
+          final snap = await _withFirestoreAuthRetry(() => query.get());
+          final indexCandidates = <String>[];
+          for (final doc in snap.docs) {
+            final data = doc.data();
+            final path = (data['path'] as String?)?.trim() ?? '';
+            if (path.isEmpty) continue;
+            if (!_isImagePath(path)) continue;
+            indexCandidates.add(path);
+          }
+
+          final displayable = <String>[];
+          for (final p in indexCandidates) {
+            if (await _shouldDisplayIndexPath(p)) {
+              displayable.add(p);
+            }
+          }
+
+          final filtered = await filterOutReservedByOtherUsers(displayable);
+          for (final p in filtered) {
+            if (newPaths.length >= _pageSize) break;
+            newPaths.add(p);
+          }
+
+          if (snap.docs.isNotEmpty) {
+            _firestoreLastDoc = snap.docs.last;
+          }
+          if (snap.docs.length < _pageSize) {
+            _hasMore = false;
+            break;
+          }
         }
       } else {
         // Walk through prefixes and list with page tokens so we don't have to
@@ -936,6 +1351,14 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
           }
         }
 
+        // Filter out reserved tickets (by other users) from this page.
+        if (newPaths.isNotEmpty) {
+          final filtered = await filterOutReservedByOtherUsers(newPaths);
+          newPaths
+            ..clear()
+            ..addAll(filtered);
+        }
+
         if (newPaths.isEmpty) {
           _hasMore = false;
         }
@@ -957,6 +1380,8 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
             }
           }
         }
+
+        _scheduleReservationWatchUpdate();
 
         // Compute aspect ratio once from the first available image.
         await _maybeComputeTicketAspectRatio(_ticketImagePaths);
@@ -990,6 +1415,9 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
   void dispose() {
     _storeConfigSub?.cancel();
     _rotationTicker?.cancel();
+    _reservationExpiryTicker?.cancel();
+    _reservationWatchDebounce?.cancel();
+    _cancelReservationWatches();
     _scrollController.dispose();
     for (final c in _digitControllers) {
       c.dispose();
@@ -1023,7 +1451,7 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text(
-          'ถุงทอง ลอตเตอรี่',
+          'ถุงทอง ล็อตเตอรี่',
           style: TextStyle(fontWeight: FontWeight.w800),
         ),
         leadingWidth: 56,
@@ -1091,7 +1519,7 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
               child: Column(
                 children: [
                   Text(
-                    'ถุงทอง ลอตเตอรี่',
+                    'ถุงทอง ล็อตเตอรี่',
                     textAlign: TextAlign.center,
                     style: Theme.of(context).textTheme.headlineMedium?.copyWith(
                       fontWeight: FontWeight.w900,
@@ -1262,15 +1690,44 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
                                           ticketNumber: ticketNumber,
                                         )) ??
                                         1;
-                                    final newRemoteCount =
-                                        await _TicketCartCollection.incrementAndGetCount(
-                                          ticketNumber: ticketNumber,
-                                          imagePath: imagePath,
-                                          delta: addQty,
-                                          setCount: addQty,
-                                          prizeMillion: meta.prizeMillion,
-                                          prizeText: meta.prizeText,
-                                        );
+                                    int? newRemoteCount;
+                                    try {
+                                      newRemoteCount =
+                                          await _TicketCartCollection.incrementAndGetCount(
+                                            ticketNumber: ticketNumber,
+                                            imagePath: imagePath,
+                                            delta: addQty,
+                                            setCount: addQty,
+                                            prizeMillion: meta.prizeMillion,
+                                            prizeText: meta.prizeText,
+                                          );
+                                    } on _TicketAlreadyReserved {
+                                      if (!context.mounted) return;
+                                      ScaffoldMessenger.of(context).showSnackBar(
+                                        const SnackBar(
+                                          content: Text(
+                                            'เลขนี้มีคนหยิบใส่ตะกร้าแล้ว กรุณาเลือกเลขอื่น',
+                                          ),
+                                          backgroundColor: Colors.red,
+                                          duration: Duration(milliseconds: 1400),
+                                        ),
+                                      );
+                                      return;
+                                    }
+
+                                    if (newRemoteCount == null) {
+                                      if (!context.mounted) return;
+                                      ScaffoldMessenger.of(context).showSnackBar(
+                                        const SnackBar(
+                                          content: Text(
+                                            'ทำรายการไม่สำเร็จ กรุณาลองใหม่',
+                                          ),
+                                          backgroundColor: Colors.red,
+                                          duration: Duration(milliseconds: 1400),
+                                        ),
+                                      );
+                                      return;
+                                    }
 
                                     if (!context.mounted) return;
 
@@ -1292,11 +1749,9 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
                                     ScaffoldMessenger.of(context).showSnackBar(
                                       SnackBar(
                                         content: Text(
-                                          newRemoteCount == null
-                                              ? 'เพิ่มลงตะกร้าแล้ว (+$addQty ใบ) (ในตะกร้า ${cart.count} ใบ)'
-                                              : (ticketNumber == null
-                                                    ? 'รายการนี้สะสมในระบบ $newRemoteCount ใบ (+$addQty) (ในตะกร้า ${cart.count} ใบ)'
-                                                    : 'เลข $ticketNumber สะสมในระบบ $newRemoteCount ใบ (+$addQty) (ในตะกร้า ${cart.count} ใบ)'),
+                                          ticketNumber == null
+                                              ? 'รายการนี้สะสมในระบบ $newRemoteCount ใบ (+$addQty) (ในตะกร้า ${cart.count} ใบ)'
+                                              : 'เลข $ticketNumber สะสมในระบบ $newRemoteCount ใบ (+$addQty) (ในตะกร้า ${cart.count} ใบ)',
                                         ),
                                         backgroundColor: Colors.green,
                                         duration: Duration(milliseconds: 900),
@@ -1634,15 +2089,44 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
                                     ticketNumber: ticketNumber,
                                   )) ??
                                   1;
-                              final newRemoteCount =
-                                  await _TicketCartCollection.incrementAndGetCount(
-                                    ticketNumber: ticketNumber,
-                                    imagePath: imagePath,
-                                    delta: addQty,
-                                    setCount: addQty,
-                                    prizeMillion: meta.prizeMillion,
-                                    prizeText: meta.prizeText,
-                                  );
+                              int? newRemoteCount;
+                              try {
+                                newRemoteCount =
+                                    await _TicketCartCollection.incrementAndGetCount(
+                                      ticketNumber: ticketNumber,
+                                      imagePath: imagePath,
+                                      delta: addQty,
+                                      setCount: addQty,
+                                      prizeMillion: meta.prizeMillion,
+                                      prizeText: meta.prizeText,
+                                    );
+                              } on _TicketAlreadyReserved {
+                                if (!context.mounted) return;
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text(
+                                      'เลขนี้มีคนหยิบใส่ตะกร้าแล้ว กรุณาเลือกเลขอื่น',
+                                    ),
+                                    backgroundColor: Colors.red,
+                                    duration: Duration(milliseconds: 1400),
+                                  ),
+                                );
+                                return;
+                              }
+
+                              if (newRemoteCount == null) {
+                                if (!context.mounted) return;
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text(
+                                      'ทำรายการไม่สำเร็จ กรุณาลองใหม่',
+                                    ),
+                                    backgroundColor: Colors.red,
+                                    duration: Duration(milliseconds: 1400),
+                                  ),
+                                );
+                                return;
+                              }
 
                               if (!context.mounted) return;
 
@@ -1658,11 +2142,9 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
                               ScaffoldMessenger.of(context).showSnackBar(
                                 SnackBar(
                                   content: Text(
-                                    newRemoteCount == null
-                                        ? 'เพิ่มลงตะกร้าแล้ว (+$addQty ใบ) (ในตะกร้า ${cart.count} ใบ)'
-                                        : (ticketNumber == null
-                                              ? 'รายการนี้สะสมในระบบ $newRemoteCount ใบ (+$addQty) (ในตะกร้า ${cart.count} ใบ)'
-                                              : 'เลข $ticketNumber สะสมในระบบ $newRemoteCount ใบ (+$addQty) (ในตะกร้า ${cart.count} ใบ)'),
+                                    ticketNumber == null
+                                        ? 'รายการนี้สะสมในระบบ $newRemoteCount ใบ (+$addQty) (ในตะกร้า ${cart.count} ใบ)'
+                                        : 'เลข $ticketNumber สะสมในระบบ $newRemoteCount ใบ (+$addQty) (ในตะกร้า ${cart.count} ใบ)',
                                   ),
                                   backgroundColor: Colors.green,
                                   duration: Duration(milliseconds: 900),
@@ -1746,6 +2228,8 @@ String? _extractTicketNumberFromPath(String imagePath) {
 class _TicketCartCollection {
   static const String _collection = 'ticket_cart_counts';
 
+  static const Duration _lockDuration = Duration(minutes: 15);
+
   static String _docId({required String imagePath, String? ticketNumber}) {
     // Document IDs can't contain '/'. Keep it stable and searchable.
     final key = (ticketNumber == null || ticketNumber.isEmpty)
@@ -1763,7 +2247,11 @@ class _TicketCartCollection {
     String? prizeText,
   }) async {
     try {
-      final uid = FirebaseAuth.instance.currentUser?.uid;
+      final user = FirebaseAuth.instance.currentUser;
+      final uid = (user == null) ? null : user.uid.trim();
+      if (uid == null || uid.isEmpty) {
+        throw StateError('User must be authenticated to reserve tickets');
+      }
       final ref = FirebaseFirestore.instance
           .collection(_collection)
           .doc(_docId(imagePath: imagePath, ticketNumber: ticketNumber));
@@ -1771,10 +2259,45 @@ class _TicketCartCollection {
       return FirebaseFirestore.instance.runTransaction<int>((tx) async {
         final snap = await tx.get(ref);
         final data = snap.data();
+
         final current = (data == null
-            ? 0
-            : (data['addedCount'] as num?)?.toInt() ?? 0);
-        final next = current + delta;
+                ? 0
+                : (data['addedCount'] as num?)?.toInt() ?? 0)
+            .clamp(0, 1 << 30);
+
+        final lockedBy = (data == null)
+          ? null
+          : (data['lockedByUid'] as String?)?.trim();
+
+        DateTime? lockedUntil;
+        final lockedUntilRaw = data == null ? null : data['lockedUntil'];
+        if (lockedUntilRaw is Timestamp) {
+          lockedUntil = lockedUntilRaw.toDate();
+        }
+        // Back-compat: if older doc has no lockedUntil, infer from lastAddedAt.
+        if (lockedUntil == null) {
+          final lastAddedAtRaw = data == null ? null : data['lastAddedAt'];
+          if (lastAddedAtRaw is Timestamp) {
+            lockedUntil = lastAddedAtRaw.toDate().add(_lockDuration);
+          }
+        }
+
+        final now = DateTime.now();
+        final lockActive = current > 0 &&
+            lockedUntil != null &&
+            now.isBefore(lockedUntil);
+
+        if (lockActive && lockedBy != null && lockedBy != uid) {
+          throw const _TicketAlreadyReserved();
+        }
+
+        // If the same user is re-adding (should be rare), keep additive semantics.
+        // Otherwise treat as a fresh reservation.
+        final next = (lockedBy == uid && lockActive)
+            ? (current + delta).clamp(0, 1 << 30)
+            : delta.clamp(0, 1 << 30);
+
+        final nextLockedUntil = now.add(_lockDuration);
 
         tx.set(ref, <String, Object?>{
           'ticketNumber': ticketNumber,
@@ -1783,12 +2306,17 @@ class _TicketCartCollection {
           if (setCount != null) 'setCount': setCount,
           if (prizeMillion != null) 'prizeMillion': prizeMillion,
           if (prizeText != null && prizeText.isNotEmpty) 'prizeText': prizeText,
+          'lockedByUid': uid,
+          'lockedUntil': Timestamp.fromDate(nextLockedUntil),
           'lastAddedAt': FieldValue.serverTimestamp(),
           'lastAddedUid': uid,
+          'lastAction': 'reserve',
         }, SetOptions(merge: true));
 
         return next;
       });
+    } on _TicketAlreadyReserved {
+      rethrow;
     } catch (e) {
       // Best-effort logging only (rules/auth may block in production).
       if (kDebugMode) {
@@ -1797,6 +2325,10 @@ class _TicketCartCollection {
       return null;
     }
   }
+}
+
+class _TicketAlreadyReserved implements Exception {
+  const _TicketAlreadyReserved();
 }
 
 class _CountdownRow extends StatelessWidget {
@@ -2268,9 +2800,7 @@ class _FirebaseStorageTicketImage extends StatelessWidget {
   static Future<String> downloadUrlFutureForPath(String path) {
     return _downloadUrls.putIfAbsent(
       path,
-      () => FirebaseStorage.instanceFor(
-        bucket: _BuyLotteryScreenState._storageBucket,
-      ).ref(path).getDownloadURL(),
+    () => FirebaseStorage.instance.ref(path).getDownloadURL(),
     );
   }
 

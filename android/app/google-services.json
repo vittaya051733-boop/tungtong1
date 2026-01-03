@@ -1,51 +1,40 @@
 {
   "project_info": {
-    "project_number": "802503541368",
-    "project_id": "van-merchant",
-    "storage_bucket": "van-merchant.firebasestorage.app"
+    "project_number": "473272933210",
+    "project_id": "tungtong-addmin",
+    "storage_bucket": "tungtong-addmin.firebasestorage.app"
   },
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:802503541368:android:c3047638df50183ff6a38d",
+        "mobilesdk_app_id": "1:473272933210:android:b4eb1c2008e57e503b3163",
         "android_client_info": {
           "package_name": "com.tungtong.admin"
         }
       },
       "oauth_client": [
         {
-          "client_id": "802503541368-ukphfk0jaq44cvuecbfrt1bpq99kifuk.apps.googleusercontent.com",
-          "client_type": 1,
-          "android_info": {
-            "package_name": "com.tungtong.admin",
-            "certificate_hash": "17d51e94743cdd9958bb4389876feb67d68e6061"
-          }
-        },
-        {
-          "client_id": "802503541368-6sh9d08648ctf3e6ujlsd8l8400uu0ej.apps.googleusercontent.com",
+          "client_id": "473272933210-ok4f6ls4nftg1rl6i0onqei86uva769i.apps.googleusercontent.com",
           "client_type": 3
         }
       ],
       "api_key": [
         {
-          "current_key": "AIzaSyCxpCxhBcphTiDsCWCxhsI8Y6p5oNhWbmI"
-        },
-        {
-          "current_key": "AIzaSyCuGZF0-EUBTuARrToDWQM5pNBMNDg2yYU"
+          "current_key": "AIzaSyBHZRmYHNAhN19X0ZX0uaCTbQezNZqb1p8"
         }
       ],
       "services": {
         "appinvite_service": {
           "other_platform_oauth_client": [
             {
-              "client_id": "802503541368-6sh9d08648ctf3e6ujlsd8l8400uu0ej.apps.googleusercontent.com",
+              "client_id": "473272933210-ok4f6ls4nftg1rl6i0onqei86uva769i.apps.googleusercontent.com",
               "client_type": 3
             },
             {
-              "client_id": "802503541368-0tg37vm56t3mvuokacoc8idm9mgj0no8.apps.googleusercontent.com",
+              "client_id": "473272933210-73hrogfvt3tvcb6jihlgi0sf8jum83v8.apps.googleusercontent.com",
               "client_type": 2,
               "ios_info": {
-                "bundle_id": "com.example.myapp"
+                "bundle_id": "com.tungtong.admin"
               }
             }
           ]
@@ -54,84 +43,42 @@
     },
     {
       "client_info": {
-        "mobilesdk_app_id": "1:802503541368:android:42ee494eea1df1cff6a38d",
+        "mobilesdk_app_id": "1:473272933210:android:75ba70307e8d69ce3b3163",
         "android_client_info": {
           "package_name": "com.tungtong.tungtong"
         }
       },
       "oauth_client": [
         {
-          "client_id": "802503541368-6sh9d08648ctf3e6ujlsd8l8400uu0ej.apps.googleusercontent.com",
-          "client_type": 3
-        }
-      ],
-      "api_key": [
-        {
-          "current_key": "AIzaSyCxpCxhBcphTiDsCWCxhsI8Y6p5oNhWbmI"
-        },
-        {
-          "current_key": "AIzaSyCuGZF0-EUBTuARrToDWQM5pNBMNDg2yYU"
-        }
-      ],
-      "services": {
-        "appinvite_service": {
-          "other_platform_oauth_client": [
-            {
-              "client_id": "802503541368-6sh9d08648ctf3e6ujlsd8l8400uu0ej.apps.googleusercontent.com",
-              "client_type": 3
-            },
-            {
-              "client_id": "802503541368-0tg37vm56t3mvuokacoc8idm9mgj0no8.apps.googleusercontent.com",
-              "client_type": 2,
-              "ios_info": {
-                "bundle_id": "com.example.myapp"
-              }
-            }
-          ]
-        }
-      }
-    },
-    {
-      "client_info": {
-        "mobilesdk_app_id": "1:802503541368:android:c8333c4310663e19f6a38d",
-        "android_client_info": {
-          "package_name": "van.merchant"
-        }
-      },
-      "oauth_client": [
-        {
-          "client_id": "802503541368-lsvnpcb7lhj8a7q7u7emqhivhtmri2f0.apps.googleusercontent.com",
+          "client_id": "473272933210-dme5clb6osn6r2facm06irf1ug7si6v5.apps.googleusercontent.com",
           "client_type": 1,
           "android_info": {
-            "package_name": "van.merchant",
+            "package_name": "com.tungtong.tungtong",
             "certificate_hash": "17d51e94743cdd9958bb4389876feb67d68e6061"
           }
         },
         {
-          "client_id": "802503541368-6sh9d08648ctf3e6ujlsd8l8400uu0ej.apps.googleusercontent.com",
+          "client_id": "473272933210-ok4f6ls4nftg1rl6i0onqei86uva769i.apps.googleusercontent.com",
           "client_type": 3
         }
       ],
       "api_key": [
         {
-          "current_key": "AIzaSyCxpCxhBcphTiDsCWCxhsI8Y6p5oNhWbmI"
-        },
-        {
-          "current_key": "AIzaSyCuGZF0-EUBTuARrToDWQM5pNBMNDg2yYU"
+          "current_key": "AIzaSyBHZRmYHNAhN19X0ZX0uaCTbQezNZqb1p8"
         }
       ],
       "services": {
         "appinvite_service": {
           "other_platform_oauth_client": [
             {
-              "client_id": "802503541368-6sh9d08648ctf3e6ujlsd8l8400uu0ej.apps.googleusercontent.com",
+              "client_id": "473272933210-ok4f6ls4nftg1rl6i0onqei86uva769i.apps.googleusercontent.com",
               "client_type": 3
             },
             {
-              "client_id": "802503541368-0tg37vm56t3mvuokacoc8idm9mgj0no8.apps.googleusercontent.com",
+              "client_id": "473272933210-73hrogfvt3tvcb6jihlgi0sf8jum83v8.apps.googleusercontent.com",
               "client_type": 2,
               "ios_info": {
-                "bundle_id": "com.example.myapp"
+                "bundle_id": "com.tungtong.admin"
               }
             }
           ]

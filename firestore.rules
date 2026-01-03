@@ -46,7 +46,40 @@ service cloud.firestore {
     // Cart counts (client-updated in current app).
     // NOTE: This is permissive. Consider moving writes to Cloud Functions later.
     match /ticket_cart_counts/{docId} {
-      allow read, write: if request.auth != null;
+      allow read: if request.auth != null;
+
+      function isAuthed() {
+        return request.auth != null && request.auth.uid != null;
+      }
+
+      function lockOwner(data) {
+        return data.lockedByUid;
+      }
+
+      function lockExpired(data) {
+        return !(data.keys().hasAny(['lockedUntil'])) || data.lockedUntil == null || data.lockedUntil <= request.time;
+      }
+
+      function sameKeyFieldsUnchanged() {
+        // Prevent changing identity fields after creation.
+        return (!('imagePath' in resource.data) || request.resource.data.imagePath == resource.data.imagePath)
+          && (!('ticketNumber' in resource.data) || request.resource.data.ticketNumber == resource.data.ticketNumber);
+      }
+
+      // Create: must lock to yourself.
+      allow create: if isAuthed()
+        && request.resource.data.lockedByUid == request.auth.uid
+        && request.resource.data.addedCount is number
+        && request.resource.data.addedCount > 0;
+
+      // Update/Delete: only lock owner OR if lock is expired/unset.
+      allow update, delete: if isAuthed()
+        && sameKeyFieldsUnchanged()
+        && (
+          lockOwner(resource.data) == request.auth.uid
+          || lockOwner(resource.data) == null
+          || lockExpired(resource.data)
+        );
     }
 
     // User cart mirror for admin visibility.

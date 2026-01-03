@@ -9,19 +9,38 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:google_sign_in/google_sign_in.dart';
-import 'package:url_launcher/url_launcher.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 
 import 'check_lottery_screen.dart';
 import 'buy_lottery_screen.dart';
 import 'cart_controller.dart';
 import 'cart_scope.dart';
+import 'admin_support_screens.dart';
 
 import 'login_screen.dart';
 
 import 'pdf_cache/pdf_cache.dart';
+
+const MethodChannel _notificationsChannel = MethodChannel('tungtong/notifications');
+
+@pragma('vm:entry-point')
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  // Ensure Firebase is initialized for background isolate.
+  try {
+    await Firebase.initializeApp();
+  } catch (_) {
+    // Best-effort only.
+  }
+}
+
+bool _isFcmSupportedPlatform() {
+  if (kIsWeb) return false;
+  return defaultTargetPlatform == TargetPlatform.android ||
+      defaultTargetPlatform == TargetPlatform.iOS;
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -33,6 +52,14 @@ Future<void> main() async {
           defaultTargetPlatform == TargetPlatform.macOS);
   if (isFirebaseSupported) {
     await Firebase.initializeApp();
+
+    if (_isFcmSupportedPlatform()) {
+      try {
+        FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+      } catch (_) {
+        // Best-effort only.
+      }
+    }
 
     // App Check: in debug use debug provider; in release use Play Integrity / DeviceCheck.
     // This avoids "No AppCheckProvider installed" and supports projects that enforce App Check.
@@ -57,14 +84,23 @@ Future<void> main() async {
   runApp(const App());
 }
 
-Future<void> _ensureAnonymousAuthIfNeeded() async {
+bool _isFirestorePermissionDenied(Object? e) {
+  return e is FirebaseException && e.code == 'permission-denied';
+}
+
+Future<bool> _ensureAnonymousAuthIfNeeded() async {
   try {
     final auth = FirebaseAuth.instance;
     if (auth.currentUser == null) {
       await auth.signInAnonymously();
     }
-  } catch (_) {
+    return auth.currentUser != null;
+  } catch (e) {
+    if (kDebugMode) {
+      debugPrint('Anonymous sign-in failed: $e');
+    }
     // Best-effort only. If Storage rules allow public read, this isn't needed.
+    return false;
   }
 }
 
@@ -81,13 +117,22 @@ class _AppState extends State<App> {
   final GlobalKey<ScaffoldMessengerState> _scaffoldMessengerKey =
       GlobalKey<ScaffoldMessengerState>();
 
+  final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
+
   StreamSubscription<User?>? _authSub;
   StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _notificationsSub;
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _supportRepliesSub;
+  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _supportChatDocSub;
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _storeConfigSub;
+  StreamSubscription<String>? _fcmTokenRefreshSub;
+  StreamSubscription<RemoteMessage>? _fcmOpenedSub;
+  StreamSubscription<RemoteMessage>? _fcmMessageSub;
+  bool _handledInitialFcmOpen = false;
 
   VoidCallback? _cartChangeListener;
   Timer? _cartMirrorDebounce;
   bool _cartMirrorSyncing = false;
+  bool _retryingStreamsForAuth = false;
 
   String? _cachedProfileUid;
   Map<String, dynamic>? _cachedProfile;
@@ -97,7 +142,17 @@ class _AppState extends State<App> {
   bool _notificationsInitialized = false;
   final Set<String> _shownNotificationIds = <String>{};
 
+  bool _supportRepliesInitialized = false;
+  String? _supportRepliesUid;
+  final Set<String> _shownSupportMessageIds = <String>{};
+
+  bool _supportChatInitialized = false;
+  String? _supportChatUid;
+  Timestamp? _lastNotifiedSupportChatAt;
+
   static const String _notificationsCollection = 'notifications';
+  static const String _supportChatsCollection = 'support_chats';
+  static const String _supportMessagesSubcollection = 'messages';
   static const String _ticketCartCountsCollection = 'ticket_cart_counts';
   static const String _storeConfigCollection = 'app_config';
   static const String _storeConfigDoc = 'global';
@@ -112,7 +167,118 @@ class _AppState extends State<App> {
     _startCartMirrorToFirestore();
     _listenAuth();
     _listenNotifications();
+    _listenSupportReplies();
+    _listenSupportChatDoc();
     _listenStoreConfigForCartExpiry();
+
+    if (_isFcmSupportedPlatform()) {
+      unawaited(_initPushNotifications());
+    }
+  }
+
+  Future<void> _initPushNotifications() async {
+    if (!_isFcmSupportedPlatform()) return;
+
+    // Android 13+: request runtime notification permission.
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+      try {
+        await _notificationsChannel.invokeMethod<bool>('requestPermission');
+      } catch (_) {
+        // Best-effort only.
+      }
+    }
+
+    // iOS: request permission.
+    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+      try {
+        await FirebaseMessaging.instance.requestPermission(
+          alert: true,
+          badge: true,
+          sound: true,
+        );
+      } catch (_) {
+        // Best-effort only.
+      }
+    }
+
+    await _syncFcmTokenToFirestore();
+
+    // If the app was opened from a notification tap (terminated state), route now.
+    await _handleInitialFcmOpen();
+
+    // If the app is in background and user taps the notification, route to chat.
+    _fcmOpenedSub?.cancel();
+    _fcmOpenedSub = FirebaseMessaging.onMessageOpenedApp.listen((message) {
+      if (_isSupportReplyPush(message)) {
+        _openSupportChat();
+      }
+    });
+
+    // Foreground push: no call handling.
+    _fcmMessageSub?.cancel();
+    _fcmMessageSub = FirebaseMessaging.onMessage.listen((message) {
+      // Intentionally no-op.
+    });
+
+    _fcmTokenRefreshSub?.cancel();
+    _fcmTokenRefreshSub = FirebaseMessaging.instance.onTokenRefresh.listen((token) {
+      unawaited(_syncFcmTokenToFirestore(tokenOverride: token));
+    });
+  }
+
+  bool _isSupportReplyPush(RemoteMessage message) {
+    final kind = (message.data['kind'] ?? '').toString().trim();
+    return kind == 'support_reply';
+  }
+
+  Future<void> _handleInitialFcmOpen() async {
+    if (_handledInitialFcmOpen) return;
+    _handledInitialFcmOpen = true;
+
+    try {
+      final initial = await FirebaseMessaging.instance.getInitialMessage();
+      if (initial == null) return;
+
+      // Ensure Navigator is ready.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_isSupportReplyPush(initial)) {
+          _openSupportChat();
+          return;
+        }
+      });
+    } catch (_) {
+      // Best-effort only.
+    }
+  }
+
+  Future<void> _syncFcmTokenToFirestore({String? tokenOverride}) async {
+    if (!_isFcmSupportedPlatform()) return;
+
+    final uid = (_currentUid ?? '').trim();
+    if (uid.isEmpty) return;
+
+    String? token = tokenOverride;
+    try {
+      token ??= await FirebaseMessaging.instance.getToken();
+    } catch (_) {
+      // Best-effort only.
+      return;
+    }
+
+    token = (token ?? '').trim();
+    if (token.isEmpty) return;
+
+    try {
+      await FirebaseFirestore.instance.collection(_userProfilesCollection).doc(uid).set(
+        {
+          'fcmTokens': FieldValue.arrayUnion([token]),
+          'fcmUpdatedAt': FieldValue.serverTimestamp(),
+        },
+        SetOptions(merge: true),
+      );
+    } catch (_) {
+      // Best-effort only.
+    }
   }
 
   void _startCartMirrorToFirestore() {
@@ -334,6 +500,31 @@ class _AppState extends State<App> {
                       ? (data?['storeOpen'] as bool)
                       : true);
             _cartController.setStoreOpen(open);
+          }, onError: (Object error, StackTrace stackTrace) {
+            if (kDebugMode) {
+              debugPrint('Cart-expiry store config stream error: $error');
+            }
+
+            if (_isFirestorePermissionDenied(error) && !_retryingStreamsForAuth) {
+              _retryingStreamsForAuth = true;
+              unawaited(_ensureAnonymousAuthIfNeeded().then((ok) {
+                _retryingStreamsForAuth = false;
+                if (!ok) {
+                  _showInAppNotification(
+                    title: 'สิทธิ์ไม่พอ',
+                    body: 'กรุณาเปิด Anonymous Sign-in ใน Firebase Auth',
+                  );
+                  return;
+                }
+                _listenStoreConfigForCartExpiry();
+              }));
+              return;
+            }
+
+            _showInAppNotification(
+              title: 'โหลดสถานะร้านไม่สำเร็จ',
+              body: '',
+            );
           });
     } catch (_) {
       // Best-effort only.
@@ -383,11 +574,16 @@ class _AppState extends State<App> {
         await FirebaseFirestore.instance.runTransaction<void>((tx) async {
           final snap = await tx.get(ref);
           final data = snap.data();
-          final current = (data == null
-              ? 0
-              : (data['addedCount'] as num?)?.toInt() ?? 0);
+          final lockedBy = (data == null)
+              ? null
+              : (data['lockedByUid'] as String?)?.trim();
+          // Only unlock if the current user owns the lock.
+          if (lockedBy != null && lockedBy.isNotEmpty && lockedBy != uid) {
+            return;
+          }
 
-          final next = (current - qty).clamp(0, 1 << 30);
+          // This project treats a cart reservation as exclusive, so release -> 0.
+          final next = 0;
           tx.set(ref, <String, Object?>{
             'ticketNumber': digits6,
             'imagePath': imagePath,
@@ -396,6 +592,8 @@ class _AppState extends State<App> {
             'lastAddedAt': FieldValue.serverTimestamp(),
             'lastAddedUid': uid,
             'lastAction': 'release',
+            'lockedByUid': FieldValue.delete(),
+            'lockedUntil': FieldValue.delete(),
           }, SetOptions(merge: true));
         });
       } catch (_) {
@@ -414,10 +612,162 @@ class _AppState extends State<App> {
         _cachedProfileUid = null;
         _cachedProfile = null;
         _cachedProfileFetchedAt = null;
+        _listenSupportReplies();
+        _listenSupportChatDoc();
+
+        if (_isFcmSupportedPlatform()) {
+          unawaited(_syncFcmTokenToFirestore());
+        }
       }
       // Always resync on any user profile/provider change.
       _scheduleCartMirrorSync();
     });
+  }
+
+  void _listenSupportChatDoc() {
+    _supportChatDocSub?.cancel();
+    _supportChatDocSub = null;
+
+    final uid = (_currentUid ?? '').trim();
+    _supportChatUid = uid.isEmpty ? null : uid;
+    _supportChatInitialized = false;
+    _lastNotifiedSupportChatAt = null;
+
+    if (uid.isEmpty) return;
+
+    try {
+      _supportChatDocSub = FirebaseFirestore.instance
+          .collection(_supportChatsCollection)
+          .doc(uid)
+          .snapshots()
+          .listen((snap) {
+        final data = snap.data();
+        if (data == null) return;
+
+        final lastAt = data['lastMessageAt'];
+        final lastMessageAt = lastAt is Timestamp ? lastAt : null;
+
+        final role = (data['lastSenderRole'] as String?)?.trim().toLowerCase();
+        final isAdmin = role == null || role.isEmpty ? true : role != 'user';
+
+        // Ignore initial snapshot so existing lastMessage doesn't spam.
+        if (!_supportChatInitialized || _supportChatUid != uid) {
+          _supportChatInitialized = true;
+          _supportChatUid = uid;
+          _lastNotifiedSupportChatAt = lastMessageAt;
+          return;
+        }
+
+        if (!isAdmin) return;
+        if (lastMessageAt == null) return;
+
+        final prev = _lastNotifiedSupportChatAt;
+        if (prev != null && !lastMessageAt.toDate().isAfter(prev.toDate())) {
+          return;
+        }
+
+        final preview = (data['lastMessagePreview'] as String?)?.trim();
+        final lastMessage = (data['lastMessage'] as String?)?.trim();
+        final body = (preview != null && preview.isNotEmpty)
+            ? preview
+            : (lastMessage ?? 'มีข้อความใหม่จากแอดมิน');
+
+        _lastNotifiedSupportChatAt = lastMessageAt;
+        _showSupportInAppNotification(body: body);
+      }, onError: (Object error, StackTrace stackTrace) {
+        if (kDebugMode) {
+          debugPrint('Support chat doc stream error: $error');
+        }
+      });
+    } catch (_) {
+      // Best-effort only.
+    }
+  }
+
+  bool _isAdminSupportMessage(Map<String, dynamic> data, String uid) {
+    final role = (data['senderRole'] as String?)?.trim().toLowerCase();
+    if (role != null && role.isNotEmpty) {
+      return role != 'user';
+    }
+
+    // Fallback: if senderUid exists and matches current user, treat as user message.
+    final senderUid = (data['senderUid'] as String?)?.trim() ?? '';
+    if (senderUid.isNotEmpty) {
+      return senderUid != uid;
+    }
+
+    // If senderUid is missing, it's almost certainly an admin/staff message.
+    // (User-created messages are required by Firestore rules to include senderUid==uid.)
+    return true;
+  }
+
+  void _listenSupportReplies() {
+    _supportRepliesSub?.cancel();
+    _supportRepliesSub = null;
+
+    final uid = (_currentUid ?? '').trim();
+    _supportRepliesUid = uid.isEmpty ? null : uid;
+    _supportRepliesInitialized = false;
+    _shownSupportMessageIds.clear();
+
+    if (uid.isEmpty) return;
+
+    try {
+      _supportRepliesSub = FirebaseFirestore.instance
+          .collection(_supportChatsCollection)
+          .doc(uid)
+          .collection(_supportMessagesSubcollection)
+          .orderBy('createdAt', descending: true)
+          .limit(50)
+          .snapshots()
+          .listen((snap) {
+            // Ignore initial snapshot so older admin messages don't spam.
+            if (!_supportRepliesInitialized || _supportRepliesUid != uid) {
+              _supportRepliesInitialized = true;
+              _supportRepliesUid = uid;
+              for (final doc in snap.docs) {
+                _shownSupportMessageIds.add(doc.id);
+              }
+              return;
+            }
+
+            for (final change in snap.docChanges) {
+              if (change.type != DocumentChangeType.added) continue;
+              final doc = change.doc;
+              if (_shownSupportMessageIds.contains(doc.id)) continue;
+
+              final data = doc.data();
+              if (data == null) continue;
+
+              if (kDebugMode) {
+                debugPrint('Support message change (added): id=${doc.id} data=$data');
+              }
+
+              // Only notify for admin/staff replies.
+              if (!_isAdminSupportMessage(data, uid)) {
+                _shownSupportMessageIds.add(doc.id);
+                continue;
+              }
+
+              final type = (data['type'] as String?)?.trim().toLowerCase() ?? 'text';
+              String body = '';
+              if (type == 'image') {
+                body = 'แอดมินส่งรูปภาพ';
+              } else {
+                body = (data['text'] as String?)?.trim() ?? '';
+              }
+
+              _shownSupportMessageIds.add(doc.id);
+              _showSupportInAppNotification(body: body);
+            }
+          }, onError: (Object error, StackTrace stackTrace) {
+            if (kDebugMode) {
+              debugPrint('Support replies stream error: $error');
+            }
+          });
+    } catch (_) {
+      // Best-effort only.
+    }
   }
 
   bool _shouldShowNotification(Map<String, dynamic> data, String? uid) {
@@ -466,6 +816,18 @@ class _AppState extends State<App> {
     );
   }
 
+  void _openSupportChat() {
+    final nav = _navigatorKey.currentState;
+    if (nav == null) return;
+    nav.push(MaterialPageRoute(builder: (_) => const _ContactSupportScreen()));
+  }
+
+  void _showSupportInAppNotification({required String body}) {
+    // Disabled: user requested no in-app bottom banner for admin replies.
+    // Push notifications (FCM) still handle background/lock-screen alerts.
+    return;
+  }
+
   void _listenNotifications() {
     _notificationsSub?.cancel();
     try {
@@ -503,6 +865,25 @@ class _AppState extends State<App> {
               _shownNotificationIds.add(doc.id);
               _showInAppNotification(title: title, body: body);
             }
+          }, onError: (Object error, StackTrace stackTrace) {
+            if (kDebugMode) {
+              debugPrint('Notifications stream error: $error');
+            }
+            if (_isFirestorePermissionDenied(error) && !_retryingStreamsForAuth) {
+              _retryingStreamsForAuth = true;
+              unawaited(_ensureAnonymousAuthIfNeeded().then((ok) {
+                _retryingStreamsForAuth = false;
+                if (!ok) {
+                  _showInAppNotification(
+                    title: 'สิทธิ์ไม่พอ',
+                    body: 'กรุณาเปิด Anonymous Sign-in ใน Firebase Auth',
+                  );
+                  return;
+                }
+                _listenNotifications();
+              }));
+              return;
+            }
           });
     } catch (_) {
       // Best-effort only.
@@ -513,7 +894,12 @@ class _AppState extends State<App> {
   void dispose() {
     _authSub?.cancel();
     _notificationsSub?.cancel();
+    _supportRepliesSub?.cancel();
+    _supportChatDocSub?.cancel();
     _storeConfigSub?.cancel();
+    _fcmTokenRefreshSub?.cancel();
+    _fcmOpenedSub?.cancel();
+    _fcmMessageSub?.cancel();
     _cartMirrorDebounce?.cancel();
     if (_cartChangeListener != null) {
       _cartController.removeListener(_cartChangeListener!);
@@ -527,9 +913,10 @@ class _AppState extends State<App> {
     return CartScope(
       controller: _cartController,
       child: MaterialApp(
-        title: 'ถุงทอง ลอตเตอรี่',
+        title: 'ถุงทอง ล็อตเตอรี่',
         debugShowCheckedModeBanner: false,
         scaffoldMessengerKey: _scaffoldMessengerKey,
+        navigatorKey: _navigatorKey,
         theme: ThemeData(
           colorScheme: ColorScheme.fromSeed(seedColor: Colors.red),
           scaffoldBackgroundColor: Colors.grey.shade100,
@@ -574,6 +961,7 @@ class _HomeScreenState extends State<HomeScreen> {
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _storeConfigSub;
   bool _storeOpen = true;
   String _storeClosedMessage = 'ปิดร้านชั่วคราว';
+  bool _retryingHomeConfigAuth = false;
 
   @override
   void initState() {
@@ -605,6 +993,36 @@ class _HomeScreenState extends State<HomeScreen> {
               _storeClosedMessage = (note == null || note.isEmpty)
                   ? 'ปิดร้านชั่วคราว'
                   : note;
+            });
+          }, onError: (Object error, StackTrace stackTrace) {
+            if (kDebugMode) {
+              debugPrint('Home store config stream error: $error');
+            }
+
+            if (_isFirestorePermissionDenied(error) && !_retryingHomeConfigAuth) {
+              _retryingHomeConfigAuth = true;
+              unawaited(_ensureAnonymousAuthIfNeeded().then((ok) {
+                _retryingHomeConfigAuth = false;
+                if (!ok || !mounted) {
+                  if (!mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                        'กรุณาเปิด Anonymous Sign-in ใน Firebase Auth เพื่อใช้งานแบบผู้เยี่ยมชม',
+                      ),
+                    ),
+                  );
+                  return;
+                }
+                _listenStoreConfig();
+              }));
+              return;
+            }
+
+            // Best-effort fallback.
+            if (!mounted) return;
+            setState(() {
+              _storeOpen = true;
             });
           });
     } catch (_) {
@@ -812,7 +1230,7 @@ class _HomeScreenState extends State<HomeScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text(
-          'ถุงทอง ลอตเตอรี่',
+          'ถุงทอง ล็อตเตอรี่',
           style: TextStyle(fontWeight: FontWeight.w800),
         ),
         leadingWidth: 56,
@@ -997,10 +1415,55 @@ class _SettingsTab extends StatefulWidget {
 
 class _SettingsTabState extends State<_SettingsTab> {
   bool _busy = false;
+  bool _isAdmin = false;
+  bool _adminChecked = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadAdminFlag());
+  }
+
+  Future<void> _loadAdminFlag() async {
+    try {
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null) {
+        if (!mounted) return;
+        setState(() {
+          _isAdmin = false;
+          _adminChecked = true;
+        });
+        return;
+      }
+
+      final token = await user.getIdTokenResult();
+      final claims = token.claims ?? const <String, Object?>{};
+      final admin = claims['admin'] == true ||
+          (claims['role']?.toString().trim().toLowerCase() == 'admin');
+
+      if (!mounted) return;
+      setState(() {
+        _isAdmin = admin;
+        _adminChecked = true;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _isAdmin = false;
+        _adminChecked = true;
+      });
+    }
+  }
 
   void _openContact() {
     Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => const _ContactSupportScreen()),
+    );
+  }
+
+  void _openAdminInbox() {
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const AdminSupportInboxScreen()),
     );
   }
 
@@ -1048,6 +1511,23 @@ class _SettingsTabState extends State<_SettingsTab> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             const SizedBox(height: 12),
+            if (_adminChecked && _isAdmin)
+              SizedBox(
+                height: 52,
+                child: OutlinedButton(
+                  style: OutlinedButton.styleFrom(
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                  onPressed: _openAdminInbox,
+                  child: const Text(
+                    'แชทลูกค้า (แอดมิน)',
+                    style: TextStyle(fontWeight: FontWeight.w900),
+                  ),
+                ),
+              ),
+            if (_adminChecked && _isAdmin) const SizedBox(height: 12),
             SizedBox(
               height: 52,
               child: OutlinedButton(
@@ -1100,18 +1580,16 @@ class _ContactSupportScreenState extends State<_ContactSupportScreen> {
 
   bool _sending = false;
   bool _sendingImage = false;
-  String? _supportPhone;
+  String? _supportUid;
 
   static const String _supportChatsCollection = 'support_chats';
   static const String _supportMessagesSubcollection = 'messages';
   static const String _supportUploadsFolder = 'uploads';
-  static const String _appConfigCollection = 'app_config';
-  static const String _appConfigDoc = 'global';
 
   @override
   void initState() {
     super.initState();
-    unawaited(_loadSupportPhone());
+    unawaited(_ensureSupportUserAndCacheUid());
   }
 
   @override
@@ -1120,53 +1598,32 @@ class _ContactSupportScreenState extends State<_ContactSupportScreen> {
     super.dispose();
   }
 
-  String? _pickFirstNonEmptyString(List<Object?> candidates) {
-    for (final v in candidates) {
-      if (v == null) continue;
-      final s = v.toString().trim();
-      if (s.isEmpty) continue;
-      if (s.toLowerCase() == 'null') continue;
-      return s;
-    }
-    return null;
-  }
-
-  String _normalizePhoneForTel(String raw) {
-    // Keep digits and leading + only.
-    final cleaned = raw.replaceAll(RegExp(r'[^0-9+]'), '');
-    if (cleaned.startsWith('+')) {
-      return '+${cleaned.substring(1).replaceAll(RegExp(r'[^0-9]'), '')}';
-    }
-    return cleaned.replaceAll(RegExp(r'[^0-9]'), '');
-  }
-
-  Future<void> _loadSupportPhone() async {
+  Future<User?> _ensureSupportUser() async {
+    final existing = FirebaseAuth.instance.currentUser;
+    if (existing != null) return existing;
     try {
-      final snap = await FirebaseFirestore.instance
-          .collection(_appConfigCollection)
-          .doc(_appConfigDoc)
-          .get();
-      final data = snap.data();
-      final phone = _pickFirstNonEmptyString([
-        data?['supportPhone'],
-        data?['contactPhone'],
-        data?['hotline'],
-        data?['phone'],
-      ]);
-      if (!mounted) return;
-      setState(() {
-        _supportPhone = (phone == null || phone.trim().isEmpty)
-            ? null
-            : _normalizePhoneForTel(phone);
-      });
-    } catch (_) {
-      // Best-effort.
+      final cred = await FirebaseAuth.instance.signInAnonymously();
+      return cred.user;
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('Support chat anonymous sign-in failed: $e');
+      }
+      return null;
     }
+  }
+
+  Future<void> _ensureSupportUserAndCacheUid() async {
+    final user = await _ensureSupportUser();
+    final uid = user?.uid.trim() ?? '';
+    if (!mounted) return;
+    if (uid.isEmpty) return;
+    setState(() {
+      _supportUid = uid;
+    });
   }
 
   DocumentReference<Map<String, dynamic>>? _chatDocRef() {
-    final user = FirebaseAuth.instance.currentUser;
-    final uid = user?.uid.trim() ?? '';
+    final uid = (_supportUid ?? FirebaseAuth.instance.currentUser?.uid ?? '').trim();
     if (uid.isEmpty) return null;
     return FirebaseFirestore.instance.collection(_supportChatsCollection).doc(uid);
   }
@@ -1188,13 +1645,13 @@ class _ContactSupportScreenState extends State<_ContactSupportScreen> {
     final text = _chatController.text.trim();
     if (text.isEmpty) return;
 
-    final user = FirebaseAuth.instance.currentUser;
+    final user = await _ensureSupportUser();
     final uid = user?.uid.trim() ?? '';
-    if (uid.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('กรุณาเข้าสู่ระบบก่อน')),
-      );
-      return;
+    if (uid.isEmpty) return;
+    if (_supportUid != uid) {
+      setState(() {
+        _supportUid = uid;
+      });
     }
 
     setState(() => _sending = true);
@@ -1244,13 +1701,13 @@ class _ContactSupportScreenState extends State<_ContactSupportScreen> {
   Future<void> _pickAndSendImage() async {
     if (_sendingImage) return;
 
-    final user = FirebaseAuth.instance.currentUser;
+    final user = await _ensureSupportUser();
     final uid = user?.uid.trim() ?? '';
-    if (uid.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('กรุณาเข้าสู่ระบบก่อน')),
-      );
-      return;
+    if (uid.isEmpty) return;
+    if (_supportUid != uid) {
+      setState(() {
+        _supportUid = uid;
+      });
     }
 
     Uint8List? bytes;
@@ -1372,31 +1829,6 @@ class _ContactSupportScreenState extends State<_ContactSupportScreen> {
     }
   }
 
-  Future<void> _callSupport() async {
-    final phone = (_supportPhone ?? '').trim();
-    if (phone.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('ยังไม่ได้ตั้งค่าเบอร์โทรติดต่อ')),
-      );
-      return;
-    }
-
-    final uri = Uri(scheme: 'tel', path: phone);
-    try {
-      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
-      if (!ok && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('ไม่สามารถโทรออกได้')),
-        );
-      }
-    } catch (_) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('ไม่สามารถโทรออกได้')),
-      );
-    }
-  }
-
   Widget _messageBubble({required String text, required bool isMe}) {
     final bg = isMe ? Colors.red.shade50 : Colors.grey.shade200;
     final align = isMe ? Alignment.centerRight : Alignment.centerLeft;
@@ -1447,13 +1879,6 @@ class _ContactSupportScreenState extends State<_ContactSupportScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('ติดต่อ สอบถาม'),
-        actions: [
-          IconButton(
-            tooltip: 'โทร',
-            onPressed: _callSupport,
-            icon: const Icon(Icons.call),
-          ),
-        ],
       ),
       body: Column(
         children: [

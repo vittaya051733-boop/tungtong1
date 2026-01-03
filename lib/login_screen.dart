@@ -9,6 +9,8 @@ import 'utils/app_colors.dart';
 import 'phone_auth_screen.dart';
 import 'utils/phone_login.dart';
 import 'email_verify_screen.dart';
+import 'cart_scope.dart';
+import 'utils/ticket_reservation.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -56,11 +58,22 @@ class _LoginScreenState extends State<LoginScreen> {
     required String email,
     required String password,
   }) async {
-    await FirebaseAuth.instance.createUserWithEmailAndPassword(
-      email: email,
-      password: password,
-    );
-    await FirebaseAuth.instance.currentUser?.sendEmailVerification();
+    final auth = FirebaseAuth.instance;
+    final current = auth.currentUser;
+
+    if (current != null && current.isAnonymous) {
+      // Upgrade the anonymous session into a real account so the UID stays
+      // the same (keeps ticket reservations and cart ownership).
+      final cred = EmailAuthProvider.credential(email: email, password: password);
+      await _linkOrMigrateAndSignIn(
+        credential: cred,
+        signIn: () => auth.signInWithEmailAndPassword(email: email, password: password),
+      );
+    } else {
+      await auth.createUserWithEmailAndPassword(email: email, password: password);
+    }
+
+    await auth.currentUser?.sendEmailVerification();
 
     if (!mounted) return false;
     final ok = await nav.push<bool>(
@@ -75,6 +88,58 @@ class _LoginScreenState extends State<LoginScreen> {
       // Best-effort.
     }
     return false;
+  }
+
+  Future<UserCredential> _linkOrMigrateAndSignIn({
+    required AuthCredential credential,
+    required Future<UserCredential> Function() signIn,
+  }) async {
+    final auth = FirebaseAuth.instance;
+    final user = auth.currentUser;
+
+    if (user != null && user.isAnonymous) {
+      try {
+        return await user.linkWithCredential(credential);
+      } on FirebaseAuthException catch (e) {
+        final canSwitch = e.code == 'credential-already-in-use' ||
+            e.code == 'email-already-in-use';
+        if (!canSwitch) rethrow;
+
+        // Existing account: we must switch users, so release the guest locks
+        // first, then sign in, then try to reserve the same items again.
+        final guestItems = CartScope.of(context).items;
+        final guestUid = user.uid;
+
+        CartScope.of(context).clear();
+        await TicketReservation.releaseForItems(items: guestItems, uid: guestUid);
+
+        final uc = await signIn();
+
+        if (!mounted) return uc;
+
+        final newUid = auth.currentUser?.uid;
+        if (newUid != null && guestItems.isNotEmpty) {
+          final okItems = await TicketReservation.reserveForItems(
+            items: guestItems,
+            uid: newUid,
+          );
+          if (!mounted) return uc;
+
+          final cart = CartScope.of(context);
+          for (final item in okItems) {
+            cart.add(item.copyWith(addedAt: DateTime.now()));
+          }
+
+          if (okItems.length != guestItems.length) {
+            _showSnack('บางรายการถูกคนอื่นหยิบไปแล้ว');
+          }
+        }
+
+        return uc;
+      }
+    }
+
+    return await signIn();
   }
 
   Future<void> _forgotPassword() async {
@@ -119,9 +184,13 @@ class _LoginScreenState extends State<LoginScreen> {
 
       setState(() => _isLoading = true);
       try {
-        await FirebaseAuth.instance.signInWithEmailAndPassword(
-          email: pseudoEmail,
-          password: password,
+        final cred = EmailAuthProvider.credential(email: pseudoEmail, password: password);
+        await _linkOrMigrateAndSignIn(
+          credential: cred,
+          signIn: () => FirebaseAuth.instance.signInWithEmailAndPassword(
+            email: pseudoEmail,
+            password: password,
+          ),
         );
 
         if (!mounted) return;
@@ -168,9 +237,13 @@ class _LoginScreenState extends State<LoginScreen> {
 
     setState(() => _isLoading = true);
     try {
-      await FirebaseAuth.instance.signInWithEmailAndPassword(
-        email: input,
-        password: password,
+      final cred = EmailAuthProvider.credential(email: input, password: password);
+      await _linkOrMigrateAndSignIn(
+        credential: cred,
+        signIn: () => FirebaseAuth.instance.signInWithEmailAndPassword(
+          email: input,
+          password: password,
+        ),
       );
 
       final user = FirebaseAuth.instance.currentUser;
@@ -274,7 +347,37 @@ class _LoginScreenState extends State<LoginScreen> {
     try {
       if (kIsWeb) {
         final provider = GoogleAuthProvider();
-        await FirebaseAuth.instance.signInWithPopup(provider);
+        final auth = FirebaseAuth.instance;
+        final user = auth.currentUser;
+        if (user != null && user.isAnonymous) {
+          final guestItems = CartScope.of(context).items;
+          final guestUid = user.uid;
+          CartScope.of(context).clear();
+          await TicketReservation.releaseForItems(items: guestItems, uid: guestUid);
+
+          await auth.signInWithPopup(provider);
+
+          if (!mounted) return;
+
+          final newUid = auth.currentUser?.uid;
+          if (newUid != null && guestItems.isNotEmpty) {
+            final okItems = await TicketReservation.reserveForItems(
+              items: guestItems,
+              uid: newUid,
+            );
+            if (!mounted) return;
+
+            final cart = CartScope.of(context);
+            for (final item in okItems) {
+              cart.add(item.copyWith(addedAt: DateTime.now()));
+            }
+            if (okItems.length != guestItems.length) {
+              _showSnack('บางรายการถูกคนอื่นหยิบไปแล้ว');
+            }
+          }
+        } else {
+          await auth.signInWithPopup(provider);
+        }
       } else {
         final googleSignIn = GoogleSignIn.instance;
         await googleSignIn.initialize();
@@ -285,10 +388,17 @@ class _LoginScreenState extends State<LoginScreen> {
         final googleUser = await googleSignIn.authenticate();
         final googleAuth = googleUser.authentication;
 
+        if (googleAuth.idToken == null || googleAuth.idToken!.isEmpty) {
+          throw Exception('Google Sign-In did not return an idToken');
+        }
+
         final credential = GoogleAuthProvider.credential(
           idToken: googleAuth.idToken,
         );
-        await FirebaseAuth.instance.signInWithCredential(credential);
+        await _linkOrMigrateAndSignIn(
+          credential: credential,
+          signIn: () => FirebaseAuth.instance.signInWithCredential(credential),
+        );
       }
 
       if (!mounted) return;
@@ -560,7 +670,7 @@ class _LoginHeader extends StatelessWidget {
         ),
         const SizedBox(height: 32),
         const Text(
-          'ถุงทอง ลอตเตอรี่',
+          'ถุงทอง ล็อตเตอรี่',
           textAlign: TextAlign.center,
           style: TextStyle(
             fontSize: 28,

@@ -5,6 +5,7 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 
 import 'cart_controller.dart';
@@ -45,6 +46,61 @@ class _CartScreenState extends State<CartScreen> {
   bool _graceSnackShown = false;
 
   final Map<String, Future<bool>> _ticketValidFutureByKey = <String, Future<bool>>{};
+
+  static const String _ticketCartCountsCollection = 'ticket_cart_counts';
+
+  String _ticketCartDocId({required String imagePath, String? ticketNumber}) {
+    final key = (ticketNumber == null || ticketNumber.trim().isEmpty)
+        ? imagePath
+        : ticketNumber.trim();
+    return key.replaceAll('/', '_');
+  }
+
+  Future<void> _releaseReservationForItem(CartItem item) async {
+    final user = FirebaseAuth.instance.currentUser;
+    final uid = (user == null) ? null : user.uid.trim();
+    if (uid == null || uid.isEmpty) return;
+
+    final imagePath = (item.imagePath ?? '').trim();
+    if (imagePath.isEmpty) return;
+
+    final digits6Raw = _extractDigits6(
+      displayName: item.displayName,
+      imagePath: item.imagePath,
+    );
+    final digits6 = (digits6Raw == '000000') ? null : digits6Raw;
+
+    final ref = FirebaseFirestore.instance
+        .collection(_ticketCartCountsCollection)
+        .doc(_ticketCartDocId(imagePath: imagePath, ticketNumber: digits6));
+
+    try {
+      await FirebaseFirestore.instance.runTransaction<void>((tx) async {
+        final snap = await tx.get(ref);
+        final data = snap.data();
+        final lockedBy = (data == null)
+            ? null
+            : (data['lockedByUid'] as String?)?.trim();
+        // Only the owner should actively unlock; if doc is missing, ignore.
+        if (lockedBy != null && lockedBy.isNotEmpty && lockedBy != uid) {
+          return;
+        }
+
+        tx.set(ref, <String, Object?>{
+          'ticketNumber': digits6,
+          'imagePath': imagePath,
+          'addedCount': 0,
+          'lockedByUid': FieldValue.delete(),
+          'lockedUntil': FieldValue.delete(),
+          'lastAddedAt': FieldValue.serverTimestamp(),
+          'lastAddedUid': uid,
+          'lastAction': 'release',
+        }, SetOptions(merge: true));
+      });
+    } catch (_) {
+      // Best-effort only.
+    }
+  }
 
   String _formatMmSs(int totalSeconds) {
     final s = totalSeconds.clamp(0, 359999);
@@ -571,6 +627,7 @@ class _CartScreenState extends State<CartScreen> {
                         if (validSnap.connectionState == ConnectionState.done &&
                             validSnap.data == false) {
                           WidgetsBinding.instance.addPostFrameCallback((_) {
+                            unawaited(_releaseReservationForItem(item));
                             cart.remove(item.id);
                           });
                           return const SizedBox.shrink();
@@ -658,7 +715,10 @@ class _CartScreenState extends State<CartScreen> {
                                 ),
                                 const SizedBox(width: 4),
                                 IconButton(
-                                  onPressed: () => cart.remove(item.id),
+                                  onPressed: () {
+                                    unawaited(_releaseReservationForItem(item));
+                                    cart.remove(item.id);
+                                  },
                                   padding: EdgeInsets.zero,
                                   constraints: const BoxConstraints(
                                     minWidth: 36,

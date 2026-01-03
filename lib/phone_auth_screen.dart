@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
 import 'utils/phone_login.dart';
+import 'cart_scope.dart';
+import 'utils/ticket_reservation.dart';
 
 class PhoneAuthScreen extends StatefulWidget {
   const PhoneAuthScreen({super.key, this.initialPhone});
@@ -97,6 +99,54 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
     });
   }
 
+  Future<void> _signInOrUpgradeWithCredential(AuthCredential credential) async {
+    final auth = FirebaseAuth.instance;
+    final user = auth.currentUser;
+
+    if (user != null && user.isAnonymous) {
+      try {
+        await user.linkWithCredential(credential);
+        return;
+      } on FirebaseAuthException catch (e) {
+        final canSwitch = e.code == 'credential-already-in-use' ||
+            e.code == 'email-already-in-use';
+        if (!canSwitch) rethrow;
+
+        if (!mounted) {
+          await auth.signInWithCredential(credential);
+          return;
+        }
+
+        final guestItems = CartScope.of(context).items;
+        final guestUid = user.uid;
+
+        CartScope.of(context).clear();
+        await TicketReservation.releaseForItems(items: guestItems, uid: guestUid);
+
+        await auth.signInWithCredential(credential);
+
+        if (!mounted) return;
+
+        final newUid = auth.currentUser?.uid;
+        if (newUid != null && guestItems.isNotEmpty) {
+          final okItems = await TicketReservation.reserveForItems(
+            items: guestItems,
+            uid: newUid,
+          );
+          if (!mounted) return;
+
+          final cart = CartScope.of(context);
+          for (final item in okItems) {
+            cart.add(item.copyWith(addedAt: DateTime.now()));
+          }
+        }
+        return;
+      }
+    }
+
+    await auth.signInWithCredential(credential);
+  }
+
   Future<void> _sendCode({required bool isResend}) async {
     if (_busy) return;
     if (kIsWeb) {
@@ -119,7 +169,7 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
         verificationCompleted: (credential) async {
           // Auto-retrieval on Android.
           try {
-            await FirebaseAuth.instance.signInWithCredential(credential);
+            await _signInOrUpgradeWithCredential(credential);
             if (!mounted) return;
             final ok = await _ensurePasswordLinked();
             if (!mounted) return;
@@ -178,7 +228,7 @@ class _PhoneAuthScreenState extends State<PhoneAuthScreen> {
         verificationId: vid,
         smsCode: code,
       );
-      await FirebaseAuth.instance.signInWithCredential(credential);
+      await _signInOrUpgradeWithCredential(credential);
       if (!mounted) return;
       final ok = await _ensurePasswordLinked();
       if (!mounted) return;

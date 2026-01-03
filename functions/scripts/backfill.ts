@@ -44,7 +44,7 @@ function getArg(name: string, fallback?: string): string | undefined {
 async function main() {
   const bucketName = getArg('bucket') ?? '';
   if (!bucketName) {
-    throw new Error('Missing --bucket. Example: npm run backfill -- --bucket van-merchant.firebasestorage.app --prefix lottery_copy');
+    throw new Error('Missing --bucket. Example: npm run backfill -- --bucket tungtong-addmin.firebasestorage.app --prefix lottery_copy');
   }
 
   const prefix = getArg('prefix', 'lottery_copy') ?? 'lottery_copy';
