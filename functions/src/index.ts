@@ -1,10 +1,14 @@
 import { initializeApp } from 'firebase-admin/app';
+import { getAuth } from 'firebase-admin/auth';
 import { getFirestore, Timestamp } from 'firebase-admin/firestore';
 import { getMessaging } from 'firebase-admin/messaging';
 import { logger } from 'firebase-functions';
 import { onDocumentCreated, onDocumentUpdated } from 'firebase-functions/v2/firestore';
 import { HttpsError, onCall } from 'firebase-functions/v2/https';
 import * as functionsV1 from 'firebase-functions/v1';
+import { defineSecret } from 'firebase-functions/params';
+import crypto from 'crypto';
+import nodemailer from 'nodemailer';
 
 export {
   syncLatestLotteryPdf,
@@ -26,6 +30,74 @@ const SUPPORT_MESSAGES_SUBCOLLECTION = 'messages';
 const USERS_COLLECTION = 'users';
 const APP_CONFIG_COLLECTION = 'app_config';
 const APP_CONFIG_DOC = 'global';
+
+const EMAIL_VERIFICATION_CODES_COLLECTION = 'email_verification_codes';
+
+const SMTP_USER_SECRET = defineSecret('SMTP_USER');
+const SMTP_PASS_SECRET = defineSecret('SMTP_PASS');
+
+function requireAuthedUid(request: any): string {
+  const uid = request.auth?.uid;
+  if (!uid) throw new HttpsError('unauthenticated', 'กรุณาเข้าสู่ระบบ');
+  return uid;
+}
+
+function requireNonEmptyString(value: unknown, field: string): string {
+  const v = String(value ?? '').trim();
+  if (!v) throw new HttpsError('invalid-argument', `กรุณากรอก ${field}`);
+  return v;
+}
+
+function getSmtpConfig() {
+  // Defaults for Gmail SMTP; can be overridden via env vars.
+  const host = String(process.env.SMTP_HOST ?? 'smtp.gmail.com').trim();
+  const portRaw = String(process.env.SMTP_PORT ?? '465').trim();
+  const fromEnv = String(process.env.SMTP_FROM ?? '').trim();
+
+  const user = String(SMTP_USER_SECRET.value() ?? '').trim();
+  const pass = String(SMTP_PASS_SECRET.value() ?? '').trim();
+  const from = fromEnv || user;
+
+  if (!user || !pass) {
+    throw new HttpsError(
+      'failed-precondition',
+      'ยังไม่ได้ตั้งค่าอีเมลผู้ส่ง (ตั้งค่า Secrets: SMTP_USER และ SMTP_PASS)'
+    );
+  }
+
+  const port = Number(portRaw);
+  if (!Number.isFinite(port) || port <= 0) {
+    throw new HttpsError('failed-precondition', 'SMTP_PORT ไม่ถูกต้อง');
+  }
+
+  if (!host) {
+    throw new HttpsError('failed-precondition', 'SMTP_HOST ไม่ถูกต้อง');
+  }
+
+  return { host, port, user, pass, from };
+}
+
+function createTransport() {
+  const cfg = getSmtpConfig();
+  return nodemailer.createTransport({
+    host: cfg.host,
+    port: cfg.port,
+    secure: cfg.port === 465,
+    auth: {
+      user: cfg.user,
+      pass: cfg.pass,
+    },
+  });
+}
+
+function generateSixDigitCode(): string {
+  const n = crypto.randomInt(0, 1000000);
+  return String(n).padStart(6, '0');
+}
+
+function hashCode(code: string, salt: string): string {
+  return crypto.createHash('sha256').update(`${code}:${salt}`, 'utf8').digest('hex');
+}
 
 function pickSupportBody(data: Record<string, unknown>): string {
   const type = String(data['type'] ?? 'text').trim().toLowerCase();
@@ -264,6 +336,147 @@ export const notifySupportReplyFromChat = onDocumentUpdated(
       successCount: resp.successCount,
       failureCount: resp.failureCount,
     });
+  }
+);
+
+export const sendEmailVerificationCode = onCall(
+  {
+    region: 'asia-southeast1',
+    secrets: [SMTP_USER_SECRET, SMTP_PASS_SECRET],
+  },
+  async (request) => {
+    const uid = requireAuthedUid(request);
+
+    const auth = getAuth();
+    const user = await auth.getUser(uid);
+    const email = String(user.email ?? '').trim();
+    if (!email) {
+      throw new HttpsError('failed-precondition', 'บัญชีนี้ไม่มีอีเมล');
+    }
+    if (user.emailVerified) {
+      return { sent: false, alreadyVerified: true };
+    }
+
+    const db = getFirestore();
+    const ref = db.collection(EMAIL_VERIFICATION_CODES_COLLECTION).doc(uid);
+    const snap = await ref.get();
+    const data = (snap.data() ?? {}) as Record<string, unknown>;
+
+    const now = Timestamp.now();
+    const lastSentAtAny = data['lastSentAt'] as any;
+    const lastSentAt = lastSentAtAny instanceof Timestamp ? lastSentAtAny : null;
+
+    // Rate limit: 60 seconds.
+    if (lastSentAt && now.toMillis() - lastSentAt.toMillis() < 60 * 1000) {
+      throw new HttpsError('resource-exhausted', 'กรุณารอสักครู่ก่อนส่งรหัสอีกครั้ง');
+    }
+
+    const code = generateSixDigitCode();
+    const salt = crypto.randomBytes(16).toString('base64');
+    const codeHash = hashCode(code, salt);
+    const expiresAt = Timestamp.fromMillis(now.toMillis() + 10 * 60 * 1000);
+
+    await ref.set(
+      {
+        email,
+        codeHash,
+        salt,
+        createdAt: now,
+        lastSentAt: now,
+        expiresAt,
+        attempts: 0,
+      },
+      { merge: true }
+    );
+
+    const cfg = getSmtpConfig();
+    const transport = createTransport();
+
+    const subject = 'รหัสยืนยันอีเมล (Tungtong)';
+    const text =
+      `รหัสยืนยันอีเมลของคุณคือ: ${code}\n` +
+      `รหัสนี้จะหมดอายุใน 10 นาที\n\n` +
+      `หากคุณไม่ได้เป็นผู้ขอรหัสนี้ สามารถละเว้นอีเมลฉบับนี้ได้`;
+
+    await transport.sendMail({
+      from: cfg.from,
+      to: email,
+      subject,
+      text,
+    });
+
+    logger.info('Sent email verification code', { uid, email });
+    return { sent: true, expiresInSec: 10 * 60 };
+  }
+);
+
+export const verifyEmailVerificationCode = onCall(
+  {
+    region: 'asia-southeast1',
+    secrets: [SMTP_USER_SECRET, SMTP_PASS_SECRET],
+  },
+  async (request) => {
+    const uid = requireAuthedUid(request);
+    const code = requireNonEmptyString((request.data as any)?.code, 'รหัส 6 หลัก');
+
+    if (!/^\d{6}$/.test(code)) {
+      throw new HttpsError('invalid-argument', 'รหัสต้องเป็นตัวเลข 6 หลัก');
+    }
+
+    const auth = getAuth();
+    const user = await auth.getUser(uid);
+    const email = String(user.email ?? '').trim();
+    if (!email) {
+      throw new HttpsError('failed-precondition', 'บัญชีนี้ไม่มีอีเมล');
+    }
+    if (user.emailVerified) {
+      return { verified: true, alreadyVerified: true };
+    }
+
+    const db = getFirestore();
+    const ref = db.collection(EMAIL_VERIFICATION_CODES_COLLECTION).doc(uid);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      throw new HttpsError('failed-precondition', 'ยังไม่ได้ขอรหัสยืนยัน');
+    }
+
+    const data = (snap.data() ?? {}) as Record<string, unknown>;
+    const storedEmail = String(data['email'] ?? '').trim();
+    if (storedEmail && storedEmail !== email) {
+      throw new HttpsError('failed-precondition', 'อีเมลมีการเปลี่ยนแปลง กรุณาขอรหัสใหม่');
+    }
+
+    const expiresAtAny = data['expiresAt'] as any;
+    const expiresAt = expiresAtAny instanceof Timestamp ? expiresAtAny : null;
+    if (!expiresAt) {
+      throw new HttpsError('failed-precondition', 'ข้อมูลรหัสไม่สมบูรณ์ กรุณาขอรหัสใหม่');
+    }
+    if (Timestamp.now().toMillis() > expiresAt.toMillis()) {
+      throw new HttpsError('deadline-exceeded', 'รหัสหมดอายุ กรุณาขอรหัสใหม่');
+    }
+
+    const attempts = Number(data['attempts'] ?? 0);
+    if (!Number.isFinite(attempts) || attempts >= 10) {
+      throw new HttpsError('resource-exhausted', 'ลองผิดหลายครั้งเกินไป กรุณาขอรหัสใหม่');
+    }
+
+    const salt = String(data['salt'] ?? '').trim();
+    const codeHash = String(data['codeHash'] ?? '').trim();
+    if (!salt || !codeHash) {
+      throw new HttpsError('failed-precondition', 'ข้อมูลรหัสไม่สมบูรณ์ กรุณาขอรหัสใหม่');
+    }
+
+    const candidate = hashCode(code, salt);
+    if (candidate !== codeHash) {
+      await ref.set({ attempts: attempts + 1 }, { merge: true });
+      throw new HttpsError('invalid-argument', 'รหัสไม่ถูกต้อง');
+    }
+
+    await auth.updateUser(uid, { emailVerified: true });
+    await ref.delete().catch(() => undefined);
+
+    logger.info('Email verified via code', { uid, email });
+    return { verified: true };
   }
 );
 

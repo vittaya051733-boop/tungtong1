@@ -73,8 +73,6 @@ class _LoginScreenState extends State<LoginScreen> {
       await auth.createUserWithEmailAndPassword(email: email, password: password);
     }
 
-    await auth.currentUser?.sendEmailVerification();
-
     if (!mounted) return false;
     final ok = await nav.push<bool>(
       MaterialPageRoute(builder: (_) => EmailVerifyScreen(email: email)),

@@ -258,6 +258,13 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
   bool _useFirestoreIndex = false;
   DocumentSnapshot<Map<String, dynamic>>? _firestoreLastDoc;
 
+  // Realtime ticket index watcher (admin add/remove -> UI updates).
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _ticketIndexSub;
+  Timer? _ticketIndexWatchDebounce;
+  int _ticketIndexWatchLimit = 0;
+  static const Duration _ticketIndexWatchDebounceDuration =
+      Duration(milliseconds: 350);
+
   // Storage pager state (supports nested prefixes by walking a prefix queue).
   final List<Reference> _storagePrefixQueue = <Reference>[];
   final Set<String> _storageSeenPrefixes = <String>{};
@@ -373,6 +380,142 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
     _startReservationExpiryTicker();
 
     _scheduleReservationWatchUpdate();
+
+    // Best-effort: realtime ticket list updates only when Firestore index exists.
+    _scheduleTicketIndexWatchUpdate();
+  }
+
+  void _stopTicketIndexWatch() {
+    _ticketIndexWatchDebounce?.cancel();
+    _ticketIndexWatchDebounce = null;
+    _ticketIndexSub?.cancel();
+    _ticketIndexSub = null;
+    _ticketIndexWatchLimit = 0;
+  }
+
+  void _scheduleTicketIndexWatchUpdate() {
+    _ticketIndexWatchDebounce?.cancel();
+    _ticketIndexWatchDebounce = Timer(_ticketIndexWatchDebounceDuration, () {
+      if (!mounted) return;
+      unawaited(_updateTicketIndexWatch());
+    });
+  }
+
+  Future<void> _updateTicketIndexWatch() async {
+    if (!mounted) return;
+    if (!_useFirestoreIndex) return;
+
+    final desiredLimit = max(
+      50,
+      min(300, _ticketImagePaths.length + _reservedByOtherUntil.length),
+    );
+
+    if (_ticketIndexSub != null && _ticketIndexWatchLimit == desiredLimit) {
+      return;
+    }
+
+    await _ticketIndexSub?.cancel();
+    _ticketIndexSub = null;
+    _ticketIndexWatchLimit = desiredLimit;
+
+    final query = FirebaseFirestore.instance
+        .collection(_firestoreIndexCollection)
+        .orderBy('createdAt', descending: true)
+        .limit(desiredLimit);
+
+    _ticketIndexSub = query.snapshots().listen(
+      (snap) {
+        if (!mounted) return;
+
+        bool changed = false;
+
+        for (final c in snap.docChanges) {
+          final data = c.doc.data();
+          final path = (data?['path'] as String?)?.trim() ?? '';
+          if (path.isEmpty) continue;
+
+          if (c.type == DocumentChangeType.removed) {
+            if (_reservedByOtherUntil.containsKey(path)) {
+              _reservedByOtherUntil.remove(path);
+              changed = true;
+            }
+            if (_randomPickedImagePath == path) {
+              _randomPickedImagePath = null;
+              changed = true;
+            }
+            if (_ticketImagePathSet.contains(path)) {
+              _removeTicketPathLocal(path);
+              changed = true;
+            }
+            continue;
+          }
+
+          if (c.type == DocumentChangeType.added) {
+            unawaited(
+              _maybeAddRealtimeIndexPath(path).then((didAdd) {
+                if (!didAdd || !mounted) return;
+                setState(() {});
+                _scheduleReservationWatchUpdate();
+                _scheduleTicketIndexWatchUpdate();
+              }),
+            );
+          }
+        }
+
+        if (changed) {
+          setState(() {});
+          _scheduleReservationWatchUpdate();
+          _scheduleTicketIndexWatchUpdate();
+        }
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        if (kDebugMode) {
+          debugPrint('Ticket index stream error: $error');
+        }
+
+        if (_isFirestorePermissionDenied(error)) {
+          unawaited(
+            _ensureAnonymousAuthForRead(showMessageIfFails: false).then((ok) {
+              if (!ok || !mounted) return;
+              _scheduleTicketIndexWatchUpdate();
+            }),
+          );
+        }
+      },
+    );
+  }
+
+  Future<bool> _maybeAddRealtimeIndexPath(String path) async {
+    final p = path.trim();
+    if (p.isEmpty) return false;
+    if (_ticketImagePathSet.contains(p)) return false;
+    if (_invalidTicketPaths.contains(p)) return false;
+    if (_reservedByOtherUntil.containsKey(p)) return false;
+
+    final ok = await _shouldDisplayIndexPath(p);
+    if (!ok || !mounted) return false;
+    if (_ticketImagePathSet.contains(p)) return false;
+    if (_reservedByOtherUntil.containsKey(p)) return false;
+
+    _addTicketPathLocalAtTop(p);
+    unawaited(_maybeComputeTicketAspectRatio(_ticketImagePaths));
+    return true;
+  }
+
+  void _addTicketPathLocalAtTop(String path) {
+    if (_ticketImagePathSet.add(path)) {
+      _ticketImagePaths.insert(0, path);
+
+      final ticketNumber = _extractTicketNumberFromPath(path);
+      if (ticketNumber != null && ticketNumber.length == 6) {
+        _countByTicketNumber[ticketNumber] =
+            (_countByTicketNumber[ticketNumber] ?? 0) + 1;
+      }
+
+      if (_mode != BuyMode.all) {
+        unawaited(_ensureSetCountLoaded(path));
+      }
+    }
   }
 
   bool _isFirestorePermissionDenied(Object? e) {
@@ -957,6 +1100,7 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
   }
 
   Future<void> _initPagerAndLoadFirstPage() async {
+    _stopTicketIndexWatch();
     if (!_firebaseStorageSupported) {
       setState(() {
         _isInitialLoading = false;
@@ -1005,6 +1149,7 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
     }
 
     await _loadNextPage();
+    _scheduleTicketIndexWatchUpdate();
     if (!mounted) return;
     setState(() => _isInitialLoading = false);
 
@@ -1382,6 +1527,7 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
         }
 
         _scheduleReservationWatchUpdate();
+        _scheduleTicketIndexWatchUpdate();
 
         // Compute aspect ratio once from the first available image.
         await _maybeComputeTicketAspectRatio(_ticketImagePaths);
@@ -1413,6 +1559,7 @@ class _BuyLotteryScreenState extends State<BuyLotteryScreen> {
 
   @override
   void dispose() {
+    _stopTicketIndexWatch();
     _storeConfigSub?.cancel();
     _rotationTicker?.cancel();
     _reservationExpiryTicker?.cancel();
